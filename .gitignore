@@ -164,4 +164,8 @@ cython_debug/
 #.idea/
 
 # Others
+<<<<<<< HEAD
 *.sublime-workspace
+=======
+*.sublime-workspace
+>>>>>>> 55c212dfafb773c4c011d7ada779e572aa1d36bb
