@@ -1,6 +1,5 @@
 from numbers import Integral, Real
 from abc import ABC, abstractmethod
-import warnings
 import operator
 
 import numpy as np
@@ -92,7 +91,6 @@ class ValidateInterval(_Validation):
 				 typing,
 				 lower,
 				 upper,
-				 warn = None,
 				 *,
 				 include,
 				 ):
@@ -101,7 +99,6 @@ class ValidateInterval(_Validation):
 		self.typing = typing
 		self.lower = lower
 		self.upper = upper
-		self.warn = warn
 		self.include = include
 
 		self._check_constraints()
@@ -139,10 +136,6 @@ class ValidateInterval(_Validation):
 			raise ValueError("Upper bound cannot be less than the lower bound."
 				        	 f"Got lower={self.lower} and upper={self.upper}.")
 
-		# Check warning msg
-		if self.warn is not None and not isinstance(self.warn, str):
-			raise TypeError("Expecting warn to be a str.")
-
 
 	def is_satisfied_by(self, val):
 		return (isinstance(val, self.typing)) and (val in self)
@@ -161,8 +154,6 @@ class ValidateInterval(_Validation):
 			return False 
 		if right_cmp(val, right):
 			return False 
-		if (self.warn is not None):
-			warnings.warn(self.warn)
 		return True
 
 	def __str__(self):

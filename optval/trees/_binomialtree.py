@@ -4,7 +4,7 @@ import inspect
 
 import numpy as np
 
-from ..utils._params_validation import ValidateInterval, ValidateChoices, RealNotInt, validate_params
+from ..utils._params_validation import ValidateInterval, ValidateChoices, validate_params
 from ._basetree import _BaseTree
 
 
@@ -53,14 +53,13 @@ class BinomialTree(_BaseTree):
 		Tree representation of underlying asset price tree for each node at
 		every time interval.
 
-	Methods
-	-------
-	
+	risk_neutral_p: float
+		Value of the risk-neutral probability
 	
 	Examples
 	--------
 	>>> from optval.trees import BinomialTree as BT
-	>>> option_1 = BT(spot_price=4.0, maturity=3.0, nom_discount_rate="25", discount_freq="D")
+	>>> option_1 = BT(spot_price=4.0, maturity=3.0, nom_discount_rate=25, discount_freq="D")
 	>>> print(option_1.price_tree)
 	[[ 4. ,  8. , 16. , 32. ],
 	 [ 0. ,  2. ,  4. ,  8. ],
@@ -84,6 +83,14 @@ class BinomialTree(_BaseTree):
 	 [ 0.     0.     0.     0.   ]
 	 [ 0.     0.     0.     0.   ]]
 	1.408
+	>>>
+	>>> option_1.get_american_price(strike=10.0, sel="put", disp_tree=True, get_tree=False)
+	Put:
+	[[6.   2.72 0.8  0.  ]
+	 [0.   8.   6.   2.  ]
+	 [0.   0.   9.   8.  ]
+	 [0.   0.   0.   9.5 ]]
+	6.0
 	"""
 
 	_parameter_constraints: dict = {
@@ -98,8 +105,7 @@ class BinomialTree(_BaseTree):
 			None
 		],
 		"up_state":[
-			ValidateInterval(Real, 1, None, include="lower"),
-			ValidateInterval(RealNotInt, 0, 1, warn="up_state has value less than 1. Reciprocal value will be taken.", include="neither")
+			ValidateInterval(Real, 0, None, include="neither")
 		],
 		"nom_discount_rate":[
 			ValidateInterval(Real, 0, None, include="lower"),
@@ -136,18 +142,23 @@ class BinomialTree(_BaseTree):
 						self.__class__.__name__)
 
 		self._dT = self.maturity / self.steps
+		self._step_disc = np.exp(self.nom_discount_rate/100*self._dT) if self.discount_freq == "C" else (1+self.nom_discount_rate/100*self._dT)
 		if self.volatility is not None:
+			# Check if condition dT < volatility^2 / (step_disc - div_yield)^2
+			# is fulfilled for p to be in the interval (0, 1)
+			# Current implementation assumes no dividend, i.e div_yield = 0
+			if self._dT > ((self.volatility)**2 / (self._step_disc)**2):
+				raise ValueError("Constraints not satisfied for risk-neutral p to fall within interval (0, 1).")
 			self._u = np.exp(self.volatility * np.sqrt(self._dT))
 		elif self.up_state < 1:
-			#warnings.warn("up_state has value less than 1. Reciprocal value will be taken.")
+			warnings.warn("up_state has value less than 1. Reciprocal value will be taken.")
 			self._u = 1 / (self.up_state**self._dT)
 		else:
 			self._u = self.up_state**self._dT
 		self._d = 1 / self._u
-		self._step_disc = np.exp(self.nom_discount_rate/100*self._dT) if self.discount_freq == "C" else (1+self.nom_discount_rate/100*self._dT)
-
 		self.risk_neutral_p = (self._step_disc - self._d) / (self._u - self._d)
 		self.price_tree = self._get_underlying_prices()
+
 
 	def _get_underlying_prices(self):
 		"""
@@ -170,29 +181,55 @@ class BinomialTree(_BaseTree):
 
 		return price_tree
 
+
 	def _pascal_triangle(self, n):
-
-		validate_params({"n": [ValidateInterval(Integral, 0, None, include="lower")]},
-						locals(),
-						f"{self.__class__.__name__}.{inspect.stack()[0][3]}")
-
 		line = np.ones(n+1)
 		for k in range(1, n+1):
 			line[k] = line[k-1] * (n-k+1) / (k)
 		return line
 
+
 	def _calculate_probas(self, i):
 		val_range = np.arange(i, -1, -1)
 		return self.risk_neutral_p**(val_range) * (1-self.risk_neutral_p)**(i - val_range)
 
+
 	def _get_probability_tree(self):
+		# Currently not in use
 		proba_tree = np.zeros((self.steps+1, self.steps+1))
 		for step in range(self.steps+1):
 			proba_tree[:step+1, step] = self._calculate_probas(step)
 			proba_tree[:step+1, step] *=  self._pascal_triangle(step)
 		return proba_tree
 
+
+	def _get_european_tree(self, payoff):
+		option_tree = np.zeros((self.steps+1, self.steps+1))
+		option_tree[ : , -1] = payoff
+		for step in np.arange(self.steps-1, -1, -1):
+			option_tree[ :step+1, step] = (1/(self._step_disc) * (self.risk_neutral_p*option_tree[ :step+1, step+1] +
+																 (1-self.risk_neutral_p)*option_tree[1:step+2, step+1])
+										  )
+		return option_tree
+
+
+	def _get_american_tree(self, cmpr, payoff):
+		option_tree = np.zeros((self.steps+1, self.steps+1))
+		option_tree[ : , -1] = payoff
+		for step in np.arange(self.steps-1, -1, -1):
+			option_tree[ :step+1, step] = np.maximum(
+													 np.maximum(cmpr(self.price_tree[ :step+1, step]), 0),
+													 (1/(self._step_disc) * (self.risk_neutral_p*option_tree[ :step+1, step+1] +
+													 						(1-self.risk_neutral_p)*option_tree[1:step+2, step+1])
+													 )
+													)
+		return option_tree
+
+
 	def summary(self):
+		"""
+		Prints a summary of the input parameters.
+		"""
 		print(f"Summary\n" +
 			  f"-" * 32 + f"\n"
 			  f"{'Spot Price ($)':<23}: {self.spot_price:>7.2f}\n"
@@ -203,16 +240,10 @@ class BinomialTree(_BaseTree):
 			  f"{'Steps':<23}: {self.steps:>7}\n"
 			 )
 
-	def _print_tree(self, payoff):
-		option_tree = np.zeros((self.steps+1, self.steps+1))
-		option_tree[ : , -1] = payoff
-		for step in np.arange(self.steps-1, -1, -1):
-			option_tree[ :step+1, step] = 1/(self._step_disc) * (self.risk_neutral_p*option_tree[ :step+1, step+1] + (1-self.risk_neutral_p)*option_tree[1:step+2, step+1])
-		return option_tree
 
 	def get_european_price(self, strike, sel="both", disp_tree=False, get_tree=False):
 		"""
-		Calculates the present value of a European call/put option for a given strike.
+		Calculates the present value of a European call/put option for a given strike price.
 		
 		Parameters
 		----------
@@ -223,12 +254,12 @@ class BinomialTree(_BaseTree):
 			Option type to be priced.
 
 		disp_tree: bool, default=False
-			When True (False by default), displays the discounted option prices 
-			at each time step.
+			When True (False by default), displays the discounted option prices at
+			each time step.
 
 		get_tree: bool, default=False
-			When True (False by default), will return the discounted option prices 
-			at each time step.
+			When True (False by default), will return the discounted option prices at
+			each time step.
 
 		Returns
 		-------
@@ -244,7 +275,7 @@ class BinomialTree(_BaseTree):
 		parity_price: float
 			Present value of put option for the given strike.
 		"""
-		
+
 		validate_params({"strike": [ValidateInterval(Real, 0, None, include="neither")],
 						 "sel": [ValidateChoices(str, choices={"call", "put", "both"})],
 						 "disp_tree": ["boolean"],
@@ -265,10 +296,10 @@ class BinomialTree(_BaseTree):
 		end_state_proba = self._pascal_triangle(self.steps) * self._calculate_probas(self.steps)
 		option_price = 1/(self._step_disc**self.steps) * np.dot(payoff, end_state_proba)
 		
-		# Present value calculated from _print_tree method should tally
+		# Present value calculated from _get_european_tree method should tally
 		if (disp_tree or get_tree):
-			payoff_tree = self._print_tree(payoff)
-			if disp_tree: print(f"Call:\n{payoff_tree}") 
+			payoff_tree = self._get_european_tree(payoff)
+			if disp_tree: print(f"{'Call' if sel == 'both' else sel.capitalize()}:\n{payoff_tree}") 
 
 		if sel not in {"both"}:
 			if not get_tree:
@@ -282,7 +313,7 @@ class BinomialTree(_BaseTree):
 		
 		if (disp_tree or get_tree):
 			parity_payoff = np.maximum(strike - self.price_tree[ : , -1], 0)
-			parity_payoff_tree = self._print_tree(parity_payoff)
+			parity_payoff_tree = self._get_european_tree(parity_payoff)
 			if disp_tree: print(f"Put:\n{parity_payoff_tree}")
 
 		if not get_tree:
@@ -292,9 +323,79 @@ class BinomialTree(_BaseTree):
 
 
 	def get_american_price(self, strike, sel="both", disp_tree=False, get_tree=False):
-		pass
+		"""
+		Calculates the present value of an American call/put option for a given strike price.
+		
+		Parameters
+		----------
+		strike: float
+			Option strike price.
 
-	def get_bermudan_call(self, strike, sel="both", disp_tree=False, get_tree=False):
+		sel: {"call","put","both"}, default="both"
+			Option type to be priced.
+
+		disp_tree: bool, default=False
+			When True (False by default), displays the discounted option prices at
+			each time step.
+
+		get_tree: bool, default=False
+			When True (False by default), will return the discounted option prices at
+			each time step.
+
+		Returns
+		-------
+		payoff_tree: array of shape (steps, steps)
+			Discounted option prices at each time step.
+
+		put_payoff_tree: array of shape (steps, steps)
+			Discounted put option prices at each time step.
+
+		option_price: float
+			Present value of selected option for the given strike.
+
+		put_option_price: float
+			Present value of put option for the given strike.
+		"""
+
+		validate_params({"strike": [ValidateInterval(Real, 0, None, include="neither")],
+						 "sel": [ValidateChoices(str, choices={"call", "put", "both"})],
+						 "disp_tree": ["boolean"],
+						 "get_tree": ["boolean"]},
+						 locals(),
+						 f"{self.__class__.__name__}.{inspect.stack()[0][3]}")
+
+		# Initialize final payoffs for the selected option type
+		if sel in {"call", "both"}:
+			payoff = np.maximum(self.price_tree[ : , -1] - strike, 0)
+			cmpr = lambda S: (S - strike)
+		else:
+			payoff = np.maximum(strike - self.price_tree[ : , -1], 0)
+			cmpr = lambda S: (strike - S)
+
+		# Calculate present value of call/put option in step-wise manner
+		payoff_tree = self._get_american_tree(cmpr, payoff)
+		option_price = payoff_tree[0, 0]
+
+		if disp_tree:
+			print(f"{'Call' if sel == 'both' else sel.capitalize()}:\n{payoff_tree}")
+		if sel not in {"both"}:
+			if not get_tree:
+				return option_price
+			else:
+				return payoff_tree, option_price
+
+		# Get present value of put option in step-wise manner if sel is 'both'
+		put_payoff_tree, put_option_price = self.get_american_price(strike, sel="put", disp_tree=False, get_tree=True)
+
+		if disp_tree:
+			print(f"Put:\n{put_payoff_tree}")
+		if not get_tree:
+			return option_price, put_option_price
+		else:
+			return payoff_tree, put_payoff_tree, option_price, put_option_price
+
+
+	def get_bermudan_price(self, strike, sel="both", disp_tree=False, get_tree=False):
 		pass
 
 	def plot_tree(self):
