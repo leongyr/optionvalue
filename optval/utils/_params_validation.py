@@ -85,6 +85,19 @@ class _ValidateBoolean(_Validation):
 		return "boolean"
 
 
+class _InstanceOf(_Validation):
+
+	def __init__(self, instance):
+		super().__init__()
+		self.instance = instance
+
+	def is_satisfied_by(self, val):
+		return isinstance(val, self.instance)
+
+	def __str__(self):
+		return f"an instance of {_type_name(self.instance)}"
+
+
 class ValidateInterval(_Validation):
 
 	def __init__(self,
@@ -192,6 +205,8 @@ def _define_validation(criteria):
 		return _ValidateNone()
 	if isinstance(criteria, str) and criteria == "boolean":
 		return _ValidateBoolean()
+	if isinstance(criteria, type):
+		return _InstanceOf(criteria)
 	raise ValueError(f"Unknown validation criteria: {criteria}")
 
 

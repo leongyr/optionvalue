@@ -4,16 +4,19 @@ import inspect
 
 import numpy as np
 
-from ..utils._params_validation import ValidateInterval, ValidateChoices, validate_params
-from ._basetree import _BaseTree
+from .._base import _Base, _BaseOption
+from ..utils._params_validation import (
+	ValidateInterval,
+	ValidateChoices,
+	validate_params
+)
 
 
-class BinomialTree(_BaseTree):
+class BinomialPricer(_Base):
 	"""
 	Binomial tree for options pricing.
-	It uses the implementation of Cox, Ross and Rubinstein (CRR), 1979.
 
-	Calculates and displays binomial trees for:
+	Currently support options include:
 	1. European call and put options
 	2. American call and put options
 	3. Bermudan call and put options
@@ -23,17 +26,41 @@ class BinomialTree(_BaseTree):
 	spot_price: float or int
 		Spot price of the underlying asset.
 
-	maturity: float
-		Time to option maturity in years.
+	option: BaseOption
+		Instance of a BaseOption class.
 
-	volatility: float or int, default=None
+	volatility: float, int or None, default=None
 		Implied volatility of the underlying asset.
 		Will take precedence over using up_state to calculate up state probability if set.
 
-	up_state: float or int, default=2
+	state: float, int or {"crr", "tian", "jr", "jrrn", "symjrrn", "adjtree"}, default=2
 		Multiple by which underlying asset is expected to increase annually.
 		If value is between 0 and 1:
 			up_state will be set as reciprocal of input value.
+		If crr:
+			Cox-Ross-Rubinstein tree implementation.
+		If tian:
+			Tian tree implementation.
+			Uses an extra D.O.F to match the first three moments.
+		If jr:
+			Non risk-neutral Jarrow-Rudd tree.
+			Probability of up state is fixed at 0.5.
+		If jrrn:
+			Jarrow-Rudd risk-neutral (JRRN) tree.
+		If symjrrn:
+			Symmetrized version of JRRN tree.
+		If adjtree:
+			text
+		If flextree:
+			text
+		If cptree:
+			text
+		If lr:
+			text
+		If j4:
+			text
+		If splittree:
+			text
 
 	nom_discount_rate: float or int, default=0
 		Nominal annual rate in percentage for discounting future values.
@@ -53,8 +80,8 @@ class BinomialTree(_BaseTree):
 		Tree representation of underlying asset price tree for each node at
 		every time interval.
 
-	risk_neutral_p: float
-		Value of the risk-neutral probability
+	p: float
+		Value of the risk-neutral probability (does not apply if state is 'jr').
 	
 	Examples
 	--------
@@ -97,15 +124,17 @@ class BinomialTree(_BaseTree):
 		"spot_price": [
 			ValidateInterval(Real, 0, None, include="neither")
 		],
-		"maturity":[
-			ValidateInterval(Real, 0, None, include="lower")
+		"option":[
+			_BaseOption
 		],
 		"volatility": [
 			ValidateInterval(Real, 0, None, include="lower"),
 			None
 		],
-		"up_state":[
-			ValidateInterval(Real, 0, None, include="neither")
+		"state":[
+			ValidateInterval(Real, 0, None, include="neither"),
+			ValidateChoices(str, choices={"crr", "tian", "jr", "jrrn", "symjrrn", "adjtree",
+										  "flextree", "cptree", "lr", "j4", "splittree"})
 		],
 		"nom_discount_rate":[
 			ValidateInterval(Real, 0, None, include="lower"),
@@ -118,46 +147,153 @@ class BinomialTree(_BaseTree):
 		]
 	}
 
+
 	def __init__(self,
 				 spot_price: float | int,
-				 maturity: float | int,
+				 option: _BaseOption,
 				 *,
-				 volatility: float | int = None,
-				 up_state: float | int = 2.,
+				 volatility: float | int | None = None,
+				 state: float | int | str = 2.,
 				 nom_discount_rate: float | int = 0.,
 				 discount_freq: str = "C",
 				 steps: int = 3):
 
 		self.spot_price = spot_price
-		self.maturity = maturity
+		self.option = option
 		self.volatility = volatility
-		self.up_state = up_state
+		self.state = state
 		self.nom_discount_rate = nom_discount_rate
 		self.discount_freq = discount_freq
 		self.steps = steps
+
+		_calibration: dict = {
+			"crr": self._crrcalib,
+			"tian": self._tiancalib,
+			"jr": self._jrcalib,
+			"jrrn": self._jrrncalib,
+			"symjrrn": self._symjrrncalib,
+			"adjtree": self._adjtreecalib,
+			"flextree": self._flextreecalib,
+			"cptree": self._cptreecalib,
+			"lr": self._lrcalib,
+			"j4": self._j4calib,
+			"splittree": self._splittreecalib,
+		}
 
 		# Validate inputs against constraints
 		validate_params(self._parameter_constraints,
 						self.get_params(),
 						self.__class__.__name__)
 
-		self._dT = self.maturity / self.steps
+		self._dT = self.option.maturity / self.steps
 		self._step_disc = np.exp(self.nom_discount_rate/100*self._dT) if self.discount_freq == "C" else (1+self.nom_discount_rate/100*self._dT)
+
+
 		if self.volatility is not None:
 			# Check if condition dT < volatility^2 / (step_disc - div_yield)^2
 			# is fulfilled for p to be in the interval (0, 1)
 			# Current implementation assumes no dividend, i.e div_yield = 0
-			if self._dT > ((self.volatility)**2 / (self._step_disc)**2):
+			if self._dT > (self.volatility / self._step_disc)**2:
 				raise ValueError("Constraints not satisfied for risk-neutral p to fall within interval (0, 1).")
-			self._u = np.exp(self.volatility * np.sqrt(self._dT))
-		elif self.up_state < 1:
-			warnings.warn("up_state has value less than 1. Reciprocal value will be taken.")
-			self._u = 1 / (self.up_state**self._dT)
+			if not isinstance(self.state, str):
+				raise TypeError(f"Invalid calibration model selection. Got {self.state}.")
+			self._u, self._d = _calibration[state]()
+		elif self.state < 1:
+			warnings.warn("state has value less than 1. Reciprocal value will be taken.")
+			self._d = self.state
+			self._u = 1 / self._d
 		else:
-			self._u = self.up_state**self._dT
-		self._d = 1 / self._u
-		self.risk_neutral_p = (self._step_disc - self._d) / (self._u - self._d)
+			self._u = self.state
+			self._d = 1 / self._u
+
+		self.p = 0.5 if state == "jr" else (self._step_disc - self._d) / (self._u - self._d)
 		self.price_tree = self._get_underlying_prices()
+
+
+	def _crrcalib(self):
+		"""
+		Cox, Ross and Rubinstein (CRR) implementation, 1979.
+		"""
+		u = np.exp(self.volatility * np.sqrt(self._dT))
+		d = 1 / u
+		return u, d
+
+
+	def _tiancalib(self):
+		r = np.exp(self._step_disc * self._dT)
+		v = np.exp(self.volatility**2 * self._dT)
+		u = 0.5 * r * v * (v + 1 + np.sqrt(v**2 + 2*v - 3))
+		d = 0.5 * r * v * (v + 1 - np.sqrt(v**2 + 2*v -3))
+		return u, d
+
+
+	def _jrcalib(self):
+		mu = self._step_disc - 0.5 * self.volatility**2
+		u = np.exp(mu*self._dT + self.volatility*np.sqrt(self._dT))
+		d = np.exp(mu*self._dT - self.volatility*np.sqrt(self._dT))
+		return u, d
+
+
+	def _jrrncalib(self):
+		u, d = self._jrcalib()
+		return u, d
+
+
+	def _symjrrncalib(self):
+		u, d = self._jrcalib()
+		X = 2 * np.exp(self._step_disc * self._dT) / (u + d)
+		return X*u, X*d
+
+
+	def _adjtreecalib(self):
+		mu = 1/self.option.maturity * (np.log(self.option.strike) - np.log(self.spot_price))
+		u = np.exp(mu*self._dT + self.volatility*np.sqrt(self._dT))
+		d = np.exp(mu*self._dT - self.volatility*np.sqrt(self._dT))
+		return u, d
+
+
+	def _flextreecalib(self):
+		j = np.ceil(
+				(np.log(self.option.strike/self.spot_price) + self.steps*self.volatility*np.sqrt(self._dT)) 
+				/ 
+				(2*self.volatility*np.sqrt(self._dT))
+			)
+		lumda = (
+			(np.log(self.option.strike/self.spot_price) - (2*j - self.steps)*self.volatility*np.sqrt(self._dT)) 
+			/ 
+			(self.steps * self.volatility**2 * self._dT)
+		)
+		u = np.exp(self.volatility*np.sqrt(self._dT) + lumda * self.volatility**2 * self._dT)
+		d = np.exp(-self.volatility*np.sqrt(self._dT) + lumda * self.volatility**2 * self._dT)
+		return u, d
+
+
+	def _cptreecalib(self):
+		j = np.ceil(
+				(np.log(self.option.strike/self.spot_price) + self.steps*self.volatility*np.sqrt(self._dT)) 
+				/ 
+				(2*self.volatility*np.sqrt(self._dT))
+			)
+		lumda = (
+			(np.log(self.option.strike/self.spot_price) - (2*j - 1 - self.steps)*self.volatility*np.sqrt(self._dT)) 
+			/ 
+			(self.steps * self.volatility**2 * self._dT)
+		)
+		u = np.exp(self.volatility*np.sqrt(self._dT) + lumda * self.volatility**2 * self._dT)
+		d = np.exp(-self.volatility*np.sqrt(self._dT) + lumda * self.volatility**2 * self._dT)
+		return u, d
+
+
+	def _lrcalib(self):
+		pass
+
+
+	def _j4calib(self):
+		pass
+
+
+	def _splittreecalib(self):
+		pass
 
 
 	def _get_underlying_prices(self):
@@ -169,7 +305,8 @@ class BinomialTree(_BaseTree):
 		price_tree: array of shape (steps, steps)
 			Underlying asset price tree.
 		"""
-		time_steps = np.linspace(0, self.maturity, self.steps+1)
+		#time_steps = np.linspace(0, self.option.maturity, self.steps+1)
+		time_steps = np.arange(0, self.steps+1)
 
 		# Calculate difference between number of up and down states at each step interval
 		state_diff = np.full((self.steps+1, self.steps+1), time_steps, dtype=float) - time_steps.reshape(-1, 1)*2
@@ -191,7 +328,7 @@ class BinomialTree(_BaseTree):
 
 	def _calculate_probas(self, i):
 		val_range = np.arange(i, -1, -1)
-		return self.risk_neutral_p**(val_range) * (1-self.risk_neutral_p)**(i - val_range)
+		return self.p**(val_range) * (1-self.p)**(i - val_range)
 
 
 	def _get_probability_tree(self):
@@ -203,29 +340,6 @@ class BinomialTree(_BaseTree):
 		return proba_tree
 
 
-	def _get_european_tree(self, payoff):
-		option_tree = np.zeros((self.steps+1, self.steps+1))
-		option_tree[ : , -1] = payoff
-		for step in np.arange(self.steps-1, -1, -1):
-			option_tree[ :step+1, step] = (1/(self._step_disc) * (self.risk_neutral_p*option_tree[ :step+1, step+1] +
-																 (1-self.risk_neutral_p)*option_tree[1:step+2, step+1])
-										  )
-		return option_tree
-
-
-	def _get_american_tree(self, cmpr, payoff):
-		option_tree = np.zeros((self.steps+1, self.steps+1))
-		option_tree[ : , -1] = payoff
-		for step in np.arange(self.steps-1, -1, -1):
-			option_tree[ :step+1, step] = np.maximum(
-													 np.maximum(cmpr(self.price_tree[ :step+1, step]), 0),
-													 (1/(self._step_disc) * (self.risk_neutral_p*option_tree[ :step+1, step+1] +
-													 						(1-self.risk_neutral_p)*option_tree[1:step+2, step+1])
-													 )
-													)
-		return option_tree
-
-
 	def summary(self):
 		"""
 		Prints a summary of the input parameters.
@@ -233,7 +347,9 @@ class BinomialTree(_BaseTree):
 		print(f"Summary\n" +
 			  f"-" * 32 + f"\n"
 			  f"{'Spot Price ($)':<23}: {self.spot_price:>7.2f}\n"
-			  f"{'Time to maturity (Yrs)':<23}: {self.maturity:>7.2f}\n"
+			  f"{'Strike Price ($)':<23}: {self.option.strike:>7.2f}\n"
+			  f"{'Payoff Type':<23}: {self.option.payoffType:>7}\n"
+			  f"{'Time to maturity (Yrs)':<23}: {self.option.maturity:>7.2f}\n"
 			  f"{'Volatility':<23}: {str(self.volatility) if self.volatility is None else self.volatility:{'>7' if self.volatility is None else '>7.3f'}}\n"
 			  f"{'Discount Rate (%)':<23}: {self.nom_discount_rate:>7.2f}\n"
 			  f"{'Discount Frequency':<23}: {self.discount_freq:>7}\n"
@@ -241,162 +357,37 @@ class BinomialTree(_BaseTree):
 			 )
 
 
-	def get_european_price(self, strike, sel="both", disp_tree=False, get_tree=False):
+	def price_option(self, tree:bool=False):
 		"""
-		Calculates the present value of a European call/put option for a given strike price.
+		Calculates the value for a given option.
 		
 		Parameters
 		----------
-		strike: float
-			Option strike price.
-
-		sel: {"call","put","both"}, default="both"
-			Option type to be priced.
-
-		disp_tree: bool, default=False
-			When True (False by default), displays the discounted option prices at
-			each time step.
-
-		get_tree: bool, default=False
-			When True (False by default), will return the discounted option prices at
-			each time step.
+		tree: bool, default=False
+			When True (False by default), returns the option prices at
+			each step in an array.
 
 		Returns
 		-------
-		payoff_tree: array of shape (steps, steps)
-			Discounted option prices at each time step.
+		price: float
+			Value of the option.
 
-		parity_payoff_tree: array of shape (steps, steps)
-			Discounted put option prices at each time step.
-
-		option_price: float
-			Present value of selected option for the given strike.
-
-		parity_price: float
-			Present value of put option for the given strike.
+		option_tree: array of shape (steps, steps)
+			Array of option prices at each step.
 		"""
 
-		validate_params({"strike": [ValidateInterval(Real, 0, None, include="neither")],
-						 "sel": [ValidateChoices(str, choices={"call", "put", "both"})],
-						 "disp_tree": ["boolean"],
-						 "get_tree": ["boolean"]},
-						 locals(),
-						 f"{self.__class__.__name__}.{inspect.stack()[0][3]}")
+		option_tree = np.zeros((self.steps+1, self.steps+1))
+		option_tree[ : , -1] = self.option.payoff(self.price_tree[ : , -1])
+		for step in np.arange(self.steps-1, -1, -1):
+			discounted_values = (1/(self._step_disc) * (self.p*option_tree[ :step+1, step+1] + 
+													   (1-self.p)*option_tree[1:step+2, step+1])
+								)
+			option_tree[ :step+1, step] = self.option.node_values(self.price_tree[ :step+1, step], discounted_values)
+		if tree:
+			return option_tree[0, 0], option_tree
+		return option_tree[0, 0]
 
-		# Initialize final payoffs for the selected option type
-		if sel in {"call", "both"}:
-			payoff = np.maximum(self.price_tree[ : , -1] - strike, 0)
-			sign = 1
-		else:
-			payoff = np.maximum(strike - self.price_tree[ : , -1], 0)
-			sign = -1
-
-		# Calculate present value of option by discounting against payoffs and probabilities at maturity
-		#end_state_proba = self._get_probability_tree()[ : , -1]
-		end_state_proba = self._pascal_triangle(self.steps) * self._calculate_probas(self.steps)
-		option_price = 1/(self._step_disc**self.steps) * np.dot(payoff, end_state_proba)
-		
-		# Present value calculated from _get_european_tree method should tally
-		if (disp_tree or get_tree):
-			payoff_tree = self._get_european_tree(payoff)
-			if disp_tree: print(f"{'Call' if sel == 'both' else sel.capitalize()}:\n{payoff_tree}") 
-
-		if sel not in {"both"}:
-			if not get_tree:
-				return option_price
-			else:
-				return payoff_tree, option_price
-
-		# Calculate present value of call/put option using call-put parity
-		# Call-put parity is given by the equation: C + PV(Strike) = P + Spot
-		parity_price = option_price - sign*self.spot_price + sign*strike*1/(self._step_disc**self.steps)
-		
-		if (disp_tree or get_tree):
-			parity_payoff = np.maximum(strike - self.price_tree[ : , -1], 0)
-			parity_payoff_tree = self._get_european_tree(parity_payoff)
-			if disp_tree: print(f"Put:\n{parity_payoff_tree}")
-
-		if not get_tree:
-			return option_price, parity_price
-		else:
-			return payoff_tree, parity_payoff_tree, option_price, parity_price
-
-
-	def get_american_price(self, strike, sel="both", disp_tree=False, get_tree=False):
-		"""
-		Calculates the present value of an American call/put option for a given strike price.
-		
-		Parameters
-		----------
-		strike: float
-			Option strike price.
-
-		sel: {"call","put","both"}, default="both"
-			Option type to be priced.
-
-		disp_tree: bool, default=False
-			When True (False by default), displays the discounted option prices at
-			each time step.
-
-		get_tree: bool, default=False
-			When True (False by default), will return the discounted option prices at
-			each time step.
-
-		Returns
-		-------
-		payoff_tree: array of shape (steps, steps)
-			Discounted option prices at each time step.
-
-		put_payoff_tree: array of shape (steps, steps)
-			Discounted put option prices at each time step.
-
-		option_price: float
-			Present value of selected option for the given strike.
-
-		put_option_price: float
-			Present value of put option for the given strike.
-		"""
-
-		validate_params({"strike": [ValidateInterval(Real, 0, None, include="neither")],
-						 "sel": [ValidateChoices(str, choices={"call", "put", "both"})],
-						 "disp_tree": ["boolean"],
-						 "get_tree": ["boolean"]},
-						 locals(),
-						 f"{self.__class__.__name__}.{inspect.stack()[0][3]}")
-
-		# Initialize final payoffs for the selected option type
-		if sel in {"call", "both"}:
-			payoff = np.maximum(self.price_tree[ : , -1] - strike, 0)
-			cmpr = lambda S: (S - strike)
-		else:
-			payoff = np.maximum(strike - self.price_tree[ : , -1], 0)
-			cmpr = lambda S: (strike - S)
-
-		# Calculate present value of call/put option in step-wise manner
-		payoff_tree = self._get_american_tree(cmpr, payoff)
-		option_price = payoff_tree[0, 0]
-
-		if disp_tree:
-			print(f"{'Call' if sel == 'both' else sel.capitalize()}:\n{payoff_tree}")
-		if sel not in {"both"}:
-			if not get_tree:
-				return option_price
-			else:
-				return payoff_tree, option_price
-
-		# Get present value of put option in step-wise manner if sel is 'both'
-		put_payoff_tree, put_option_price = self.get_american_price(strike, sel="put", disp_tree=False, get_tree=True)
-
-		if disp_tree:
-			print(f"Put:\n{put_payoff_tree}")
-		if not get_tree:
-			return option_price, put_option_price
-		else:
-			return payoff_tree, put_payoff_tree, option_price, put_option_price
-
-
-	def get_bermudan_price(self, strike, sel="both", disp_tree=False, get_tree=False):
-		pass
 
 	def plot_tree(self):
 		pass
+

@@ -1,1 +1,5 @@
-from ._binomialtree import BinomialTree
+from ._binomialtree import BinomialPricer
+
+__all__ = [
+	"BinomialPricer"
+]
